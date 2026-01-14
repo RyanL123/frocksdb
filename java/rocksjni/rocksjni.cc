@@ -3392,6 +3392,43 @@ void Java_org_rocksdb_RocksDB_endTrace(JNIEnv* env, jobject, jlong jdb_handle) {
 
 /*
  * Class:     org_rocksdb_RocksDB
+ * Method:    startBlockCacheTrace
+ * Signature: (JJJ)V
+ */
+void Java_org_rocksdb_RocksDB_startBlockCacheTrace(
+    JNIEnv* env, jobject, jlong jdb_handle, jlong jmax_trace_file_size,
+    jlong jtrace_writer_jnicallback_handle) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  ROCKSDB_NAMESPACE::TraceOptions trace_options;
+  trace_options.max_trace_file_size = 
+      static_cast<uint64_t>(jmax_trace_file_size);
+  // transfer ownership of trace writer from Java to C++
+  auto trace_writer =
+      std::unique_ptr<ROCKSDB_NAMESPACE::TraceWriterJniCallback>(
+          reinterpret_cast<ROCKSDB_NAMESPACE::TraceWriterJniCallback*>(
+              jtrace_writer_jnicallback_handle));
+  auto s = db->StartBlockCacheTrace(trace_options, std::move(trace_writer));
+  if (!s.ok()) {
+    ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+  }
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
+ * Method:    endBlockCacheTrace
+ * Signature: (J)V
+ */
+void Java_org_rocksdb_RocksDB_endBlockCacheTrace(
+    JNIEnv* env, jobject, jlong jdb_handle) {
+  auto* db = reinterpret_cast<ROCKSDB_NAMESPACE::DB*>(jdb_handle);
+  auto s = db->EndBlockCacheTrace();
+  if (!s.ok()) {
+    ROCKSDB_NAMESPACE::RocksDBExceptionJni::ThrowNew(env, s);
+  }
+}
+
+/*
+ * Class:     org_rocksdb_RocksDB
  * Method:    tryCatchUpWithPrimary
  * Signature: (J)V
  */

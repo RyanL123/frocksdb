@@ -4354,6 +4354,38 @@ public class RocksDB extends RocksObject {
   }
 
   /**
+   * Trace block cache accesses.
+   *
+   * Use {@link #endBlockCacheTrace()} to stop tracing.
+   *
+   * @param traceOptions the options
+   * @param traceWriter the trace writer
+   *
+   * @throws RocksDBException if an error occurs whilst starting the trace
+   */
+  public void startBlockCacheTrace(final TraceOptions traceOptions,
+      final AbstractTraceWriter traceWriter) throws RocksDBException {
+    startBlockCacheTrace(nativeHandle_, traceOptions.getMaxTraceFileSize(),
+        traceWriter.nativeHandle_);
+    /**
+     * NOTE: {@link #startBlockCacheTrace(long, long, long)} transfers the ownership
+     * from Java to C++, so we must disown the native handle here.
+     */
+    traceWriter.disOwnNativeHandle();
+  }
+
+  /**
+   * Stop tracing block cache accesses.
+   *
+   * See {@link #startBlockCacheTrace(TraceOptions, AbstractTraceWriter)}
+   *
+   * @throws RocksDBException if an error occurs whilst ending the trace
+   */
+  public void endBlockCacheTrace() throws RocksDBException {
+    endBlockCacheTrace(nativeHandle_);
+  }
+
+  /**
    * Make the secondary instance catch up with the primary by tailing and
    * replaying the MANIFEST and WAL of the primary.
    * Column families created by the primary after the secondary instance starts
@@ -4746,6 +4778,9 @@ public class RocksDB extends RocksObject {
   private native void startTrace(final long handle, final long maxTraceFileSize,
       final long traceWriterHandle) throws RocksDBException;
   private native void endTrace(final long handle) throws RocksDBException;
+  private native void startBlockCacheTrace(final long handle, final long maxTraceFileSize,
+      final long traceWriterHandle) throws RocksDBException;
+  private native void endBlockCacheTrace(final long handle) throws RocksDBException;
   private native void tryCatchUpWithPrimary(final long handle) throws RocksDBException;
   private native void deleteFilesInRanges(long handle, long cfHandle, final byte[][] ranges,
       boolean include_end) throws RocksDBException;
