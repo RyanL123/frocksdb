@@ -75,8 +75,56 @@ public class LRUCache extends Cache {
         highPriPoolRatio));
   }
 
+  /**
+   * Enable ghost cache for miss-rate curve generation.
+   * 
+   * @param ghostCapacity The capacity of the ghost cache (typically 2x cache capacity)
+   * @param distanceBuckets Array of cache size boundaries for MRC buckets (in bytes)
+   *                        Example: {1024, 4096, 16384, 65536} for 1KB, 4KB, 16KB, 64KB
+   * @throws RocksDBException if an error occurs
+   */
+  public void enableGhostCache(final long ghostCapacity, final long[] distanceBuckets) 
+      throws RocksDBException {
+    enableGhostCache(nativeHandle_, ghostCapacity, distanceBuckets);
+  }
+
+  /**
+   * Get the current miss-rate curve.
+   * 
+   * @return MissRateCurveResult containing cache sizes and corresponding miss rates
+   * @throws RocksDBException if ghost cache is not enabled or an error occurs
+   */
+  public MissRateCurveResult getMissRateCurve() throws RocksDBException {
+    return getMissRateCurve(nativeHandle_);
+  }
+
+  /**
+   * Get bucket statistics for distributed MRC merging (section 3.4.2).
+   * This returns raw hit/miss counts per bucket that can be merged across
+   * multiple Flink tasks/machines.
+   * 
+   * @return BucketStatistics containing cache sizes, hits, and misses per bucket
+   * @throws RocksDBException if ghost cache is not enabled or an error occurs
+   */
+  public BucketStatistics getBucketStatistics() throws RocksDBException {
+    return getBucketStatistics(nativeHandle_);
+  }
+
+  /**
+   * Reset miss-rate curve statistics.
+   * This clears all accumulated hit/miss statistics while keeping the ghost cache active.
+   */
+  public void resetMRCStats() {
+    resetMRCStats(nativeHandle_);
+  }
+
   private native static long newLRUCache(final long capacity,
       final int numShardBits, final boolean strictCapacityLimit,
       final double highPriPoolRatio);
+  private native void enableGhostCache(final long handle, final long ghostCapacity,
+                                      final long[] distanceBuckets) throws RocksDBException;
+  private native MissRateCurveResult getMissRateCurve(final long handle) throws RocksDBException;
+  private native BucketStatistics getBucketStatistics(final long handle) throws RocksDBException;
+  private native void resetMRCStats(final long handle);
   @Override protected final native void disposeInternal(final long handle);
 }

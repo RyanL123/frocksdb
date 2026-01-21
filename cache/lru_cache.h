@@ -12,6 +12,10 @@
 
 #include "cache/sharded_cache.h"
 
+#include <atomic>
+#include <unordered_map>
+#include <vector>
+
 #include "port/malloc.h"
 #include "port/port.h"
 #include "util/autovector.h"
@@ -242,6 +246,21 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   //  Retrieves high pri pool ratio
   double GetHighPriPoolRatio();
 
+  // Ghost cache and MRC functions
+  void EnableGhostCache(size_t ghost_capacity, 
+                        const std::vector<uint64_t>& distance_buckets);
+  void GetMissRateCurve(std::vector<uint64_t>* cache_sizes,
+                       std::vector<double>* miss_rates) const;
+  void ResetMRCStats();
+  
+  // Bucket statistics for distributed MRC merging (section 3.4.2)
+  struct BucketStatistics {
+    std::vector<uint64_t> cache_sizes;
+    std::vector<uint64_t> hits;
+    std::vector<uint64_t> misses;
+  };
+  BucketStatistics GetBucketStatistics() const;
+
  private:
   void LRU_Remove(LRUHandle* e);
   void LRU_Insert(LRUHandle* e);
@@ -255,6 +274,47 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   // This function is not thread safe - it needs to be executed while
   // holding the mutex_
   void EvictFromLRU(size_t charge, autovector<LRUHandle*>* deleted);
+
+  // Ghost cache structures and functions for stack distance estimation
+  struct GhostCacheEntry {
+    std::string key;
+    uint32_t hash;
+    size_t charge;
+    uint64_t evict_sequence;
+    GhostCacheEntry* next;
+    GhostCacheEntry* prev;
+    
+    GhostCacheEntry() : hash(0), charge(0), evict_sequence(0), next(nullptr), prev(nullptr) {}
+  };
+
+  // Ghost cache operations
+  void InsertIntoGhostCache(const Slice& key, uint32_t hash, size_t charge, uint64_t sequence);
+  bool LookupInGhostCache(const Slice& key, uint32_t hash, uint64_t current_sequence,
+                          uint64_t* estimated_stack_distance);
+  void RemoveFromGhostList(GhostCacheEntry* entry);
+  void InsertAtGhostHead(GhostCacheEntry* entry);
+  void EvictFromGhostCache();
+  uint64_t EstimateStackDistanceFromBuckets(const Slice& key, uint32_t hash,
+                                             uint64_t current_sequence);
+  void RecordAccessInBuckets(const Slice& key, uint32_t hash, uint64_t current_sequence,
+                             bool is_hit);
+  
+  // Ghost cache data members
+  bool ghost_cache_enabled_;
+  GhostCacheEntry ghost_lru_head_;  // Dummy head
+  GhostCacheEntry* ghost_lru_tail_;  // Most recently evicted
+  size_t ghost_cache_size_;  // Number of entries in ghost cache
+  size_t ghost_cache_capacity_;  // Max ghost entries
+  std::unordered_map<uint32_t, GhostCacheEntry*> ghost_table_;  // Hash table for fast lookup
+  
+  // Bucket-based stack distance tracking
+  std::vector<uint64_t> distance_buckets_;  // Bucket boundaries
+  std::vector<uint64_t> bucket_hits_;       // Hits per bucket
+  std::vector<uint64_t> bucket_misses_;     // Misses per bucket
+  
+  // Sequence counters (atomic for thread safety)
+  std::atomic<uint64_t> evict_sequence_;
+  std::atomic<uint64_t> access_sequence_;
 
   // Initialized before use.
   size_t capacity_;
@@ -330,6 +390,9 @@ class LRUCache
   size_t TEST_GetLRUSize();
   //  Retrieves high pri pool ratio
   double GetHighPriPoolRatio();
+  
+  // Aggregate bucket statistics from all shards for distributed MRC merging
+  LRUCacheShard::BucketStatistics GetBucketStatistics() const;
 
  private:
   LRUCacheShard* shards_ = nullptr;

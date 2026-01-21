@@ -9,10 +9,12 @@
 
 #include "cache/lru_cache.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <string>
 
+#include "rocksdb/slice.h"
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -98,7 +100,13 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
                              double high_pri_pool_ratio,
                              bool use_adaptive_mutex,
                              CacheMetadataChargePolicy metadata_charge_policy)
-    : capacity_(0),
+    : ghost_cache_enabled_(false),
+      ghost_lru_tail_(nullptr),
+      ghost_cache_size_(0),
+      ghost_cache_capacity_(0),
+      evict_sequence_(0),
+      access_sequence_(0),
+      capacity_(0),
       high_pri_pool_usage_(0),
       strict_capacity_limit_(strict_capacity_limit),
       high_pri_pool_ratio_(high_pri_pool_ratio),
@@ -111,6 +119,10 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
   lru_.next = &lru_;
   lru_.prev = &lru_;
   lru_low_pri_ = &lru_;
+  // Initialize ghost cache list
+  ghost_lru_head_.next = &ghost_lru_head_;
+  ghost_lru_head_.prev = &ghost_lru_head_;
+  ghost_lru_tail_ = &ghost_lru_head_;
   SetCapacity(capacity);
 }
 
@@ -237,6 +249,15 @@ void LRUCacheShard::EvictFromLRU(size_t charge,
     LRUHandle* old = lru_.next;
     // LRU list contains only elements which can be evicted
     assert(old->InCache() && !old->HasRefs());
+    
+    // Insert into ghost cache before eviction
+    if (ghost_cache_enabled_) {
+      uint64_t seq = evict_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
+      InsertIntoGhostCache(old->key(), old->hash,
+                          old->CalcTotalCharge(metadata_charge_policy_),
+                          seq);
+    }
+    
     LRU_Remove(old);
     table_.Remove(old->key(), old->hash);
     old->SetInCache(false);
@@ -270,6 +291,18 @@ void LRUCacheShard::SetStrictCapacityLimit(bool strict_capacity_limit) {
 Cache::Handle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash) {
   MutexLock l(&mutex_);
   LRUHandle* e = table_.Lookup(key, hash);
+  
+  if (ghost_cache_enabled_) {
+    uint64_t seq = access_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (e != nullptr) {
+      // Cache hit
+      RecordAccessInBuckets(key, hash, seq, true);
+    } else {
+      // Cache miss - check ghost cache for stack distance estimation
+      RecordAccessInBuckets(key, hash, seq, false);
+    }
+  }
+  
   if (e != nullptr) {
     assert(e->InCache());
     if (!e->HasRefs()) {
@@ -543,6 +576,43 @@ double LRUCache::GetHighPriPoolRatio() {
   return result;
 }
 
+LRUCacheShard::BucketStatistics LRUCache::GetBucketStatistics() const {
+  LRUCacheShard::BucketStatistics aggregated;
+  
+  if (shards_ == nullptr || num_shards_ == 0) {
+    return aggregated;
+  }
+  
+  // Collect statistics from first shard to get bucket structure
+  LRUCacheShard::BucketStatistics first = shards_[0].GetBucketStatistics();
+  if (first.cache_sizes.empty()) {
+    return aggregated;
+  }
+  
+  // Initialize aggregated statistics with bucket structure
+  aggregated.cache_sizes = first.cache_sizes;
+  aggregated.hits.resize(first.cache_sizes.size(), 0);
+  aggregated.misses.resize(first.cache_sizes.size(), 0);
+  
+  // Aggregate statistics from all shards
+  for (int i = 0; i < num_shards_; i++) {
+    LRUCacheShard::BucketStatistics shard_stats = shards_[i].GetBucketStatistics();
+    // Verify bucket structure matches
+    if (shard_stats.cache_sizes.size() != aggregated.cache_sizes.size()) {
+      continue;  // Skip if structure doesn't match
+    }
+    
+    for (size_t j = 0; j < aggregated.cache_sizes.size(); j++) {
+      if (shard_stats.cache_sizes[j] == aggregated.cache_sizes[j]) {
+        aggregated.hits[j] += shard_stats.hits[j];
+        aggregated.misses[j] += shard_stats.misses[j];
+      }
+    }
+  }
+  
+  return aggregated;
+}
+
 std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts) {
   return NewLRUCache(cache_opts.capacity, cache_opts.num_shard_bits,
                      cache_opts.strict_capacity_limit,
@@ -569,6 +639,228 @@ std::shared_ptr<Cache> NewLRUCache(
   return std::make_shared<LRUCache>(
       capacity, num_shard_bits, strict_capacity_limit, high_pri_pool_ratio,
       std::move(memory_allocator), use_adaptive_mutex, metadata_charge_policy);
+}
+
+// Ghost cache implementation functions
+void LRUCacheShard::EnableGhostCache(size_t ghost_capacity,
+                                     const std::vector<uint64_t>& distance_buckets) {
+  MutexLock l(&mutex_);
+  ghost_cache_enabled_ = true;
+  ghost_cache_capacity_ = ghost_capacity;
+  distance_buckets_ = distance_buckets;
+  bucket_hits_.resize(distance_buckets_.size(), 0);
+  bucket_misses_.resize(distance_buckets_.size(), 0);
+  evict_sequence_.store(0, std::memory_order_relaxed);
+  access_sequence_.store(0, std::memory_order_relaxed);
+}
+
+void LRUCacheShard::InsertIntoGhostCache(const Slice& key, uint32_t hash,
+                                         size_t charge, uint64_t sequence) {
+  // This function is called from EvictFromLRU which already holds the mutex
+  mutex_.AssertHeld();
+  
+  // Check if key already exists in ghost cache
+  auto it = ghost_table_.find(hash);
+  if (it != ghost_table_.end()) {
+    GhostCacheEntry* entry = it->second;
+    // Check if it's actually the same key (hash collision)
+    if (entry->key == key.ToString()) {
+      // Move to front (most recently evicted)
+      RemoveFromGhostList(entry);
+      InsertAtGhostHead(entry);
+      entry->evict_sequence = sequence;
+      entry->charge = charge;
+      return;
+    }
+  }
+  
+  // Create new ghost entry (no value stored, just metadata)
+  GhostCacheEntry* entry = new GhostCacheEntry();
+  entry->key = key.ToString();
+  entry->hash = hash;
+  entry->charge = charge;
+  entry->evict_sequence = sequence;
+  
+  // Insert at head (most recently evicted)
+  InsertAtGhostHead(entry);
+  ghost_table_[hash] = entry;
+  ghost_cache_size_++;
+  
+  // Evict oldest ghost entry if capacity exceeded
+  while (ghost_cache_size_ > ghost_cache_capacity_ &&
+         ghost_lru_tail_ != &ghost_lru_head_) {
+    EvictFromGhostCache();
+  }
+}
+
+bool LRUCacheShard::LookupInGhostCache(const Slice& key, uint32_t hash,
+                                       uint64_t current_sequence,
+                                       uint64_t* estimated_stack_distance) {
+  mutex_.AssertHeld();
+  
+  auto it = ghost_table_.find(hash);
+  if (it == ghost_table_.end()) {
+    return false;  // Not in ghost cache
+  }
+  
+  GhostCacheEntry* entry = it->second;
+  // Check if it's actually the same key (hash collision)
+  if (entry->key != key.ToString()) {
+    return false;
+  }
+  
+  // Estimate stack distance based on sequence difference
+  // Stack distance = number of items evicted since this item
+  if (current_sequence > entry->evict_sequence) {
+    *estimated_stack_distance = current_sequence - entry->evict_sequence;
+  } else {
+    *estimated_stack_distance = 0;
+  }
+  
+  // Move to head (recently accessed in ghost)
+  RemoveFromGhostList(entry);
+  InsertAtGhostHead(entry);
+  entry->evict_sequence = current_sequence;
+  
+  return true;
+}
+
+void LRUCacheShard::RemoveFromGhostList(GhostCacheEntry* entry) {
+  mutex_.AssertHeld();
+  entry->prev->next = entry->next;
+  entry->next->prev = entry->prev;
+  if (ghost_lru_tail_ == entry) {
+    ghost_lru_tail_ = entry->prev;
+  }
+}
+
+void LRUCacheShard::InsertAtGhostHead(GhostCacheEntry* entry) {
+  mutex_.AssertHeld();
+  entry->next = ghost_lru_head_.next;
+  entry->prev = &ghost_lru_head_;
+  ghost_lru_head_.next->prev = entry;
+  ghost_lru_head_.next = entry;
+  if (ghost_lru_tail_ == &ghost_lru_head_) {
+    ghost_lru_tail_ = entry;
+  }
+}
+
+void LRUCacheShard::EvictFromGhostCache() {
+  mutex_.AssertHeld();
+  if (ghost_lru_tail_ == &ghost_lru_head_) {
+    return;
+  }
+  
+  GhostCacheEntry* to_remove = ghost_lru_tail_;
+  ghost_lru_tail_ = ghost_lru_tail_->prev;
+  ghost_table_.erase(to_remove->hash);
+  RemoveFromGhostList(to_remove);
+  delete to_remove;
+  ghost_cache_size_--;
+}
+
+uint64_t LRUCacheShard::EstimateStackDistanceFromBuckets(
+    const Slice& key, uint32_t hash, uint64_t current_sequence) {
+  mutex_.AssertHeld();
+  
+  uint64_t estimated_distance = 0;
+  
+  // Check if key is in ghost cache (recently evicted)
+  if (LookupInGhostCache(key, hash, current_sequence, &estimated_distance)) {
+    // Found in ghost cache - estimate based on sequence difference
+    return estimated_distance;
+  }
+  
+  // Not in ghost cache - estimate based on bucket sizes
+  // Approach: Count items in ghost cache to estimate position
+  // Stack distance ≈ (number of items in ghost cache) + (current cache size)
+  estimated_distance = ghost_cache_size_ + usage_;
+  
+  return estimated_distance;
+}
+
+void LRUCacheShard::RecordAccessInBuckets(const Slice& key, uint32_t hash,
+                                          uint64_t current_sequence, bool is_hit) {
+  mutex_.AssertHeld();
+  
+  if (distance_buckets_.empty()) {
+    return;
+  }
+  
+  uint64_t stack_dist = EstimateStackDistanceFromBuckets(key, hash, current_sequence);
+  
+  // Find which bucket this belongs to
+  size_t bucket_idx = distance_buckets_.size();  // Default to last bucket (overflow)
+  for (size_t i = 0; i < distance_buckets_.size(); i++) {
+    if (stack_dist < distance_buckets_[i]) {
+      bucket_idx = i;
+      break;
+    }
+  }
+  
+  if (is_hit) {
+    // Cache hit - this cache size would have been a hit
+    if (bucket_idx < bucket_hits_.size()) {
+      bucket_hits_[bucket_idx]++;
+    }
+  } else {
+    // Cache miss - determine which bucket sizes would have been hits/misses
+    for (size_t i = 0; i < distance_buckets_.size(); i++) {
+      if (stack_dist < distance_buckets_[i]) {
+        // This cache size would have been a hit
+        bucket_hits_[i]++;
+      } else {
+        // This cache size would have been a miss
+        bucket_misses_[i]++;
+      }
+    }
+  }
+}
+
+void LRUCacheShard::GetMissRateCurve(std::vector<uint64_t>* cache_sizes,
+                                     std::vector<double>* miss_rates) const {
+  MutexLock l(&mutex_);
+  
+  cache_sizes->clear();
+  miss_rates->clear();
+  
+  if (!ghost_cache_enabled_ || distance_buckets_.empty()) {
+    return;
+  }
+  
+  for (size_t i = 0; i < distance_buckets_.size(); i++) {
+    uint64_t total_accesses = bucket_hits_[i] + bucket_misses_[i];
+    if (total_accesses > 0) {
+      double miss_rate = static_cast<double>(bucket_misses_[i]) / total_accesses;
+      cache_sizes->push_back(distance_buckets_[i]);
+      miss_rates->push_back(miss_rate);
+    }
+  }
+}
+
+void LRUCacheShard::ResetMRCStats() {
+  MutexLock l(&mutex_);
+  std::fill(bucket_hits_.begin(), bucket_hits_.end(), 0);
+  std::fill(bucket_misses_.begin(), bucket_misses_.end(), 0);
+  evict_sequence_.store(0, std::memory_order_relaxed);
+  access_sequence_.store(0, std::memory_order_relaxed);
+}
+
+LRUCacheShard::BucketStatistics LRUCacheShard::GetBucketStatistics() const {
+  MutexLock l(&mutex_);
+  BucketStatistics stats;
+  
+  if (!ghost_cache_enabled_ || distance_buckets_.empty()) {
+    return stats;
+  }
+  
+  for (size_t i = 0; i < distance_buckets_.size(); i++) {
+    stats.cache_sizes.push_back(distance_buckets_[i]);
+    stats.hits.push_back(bucket_hits_[i]);
+    stats.misses.push_back(bucket_misses_[i]);
+  }
+  
+  return stats;
 }
 
 }  // namespace ROCKSDB_NAMESPACE
