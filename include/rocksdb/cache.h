@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <memory>
 #include <string>
+#include <vector>
 #include "rocksdb/memory_allocator.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/statistics.h"
@@ -87,20 +88,45 @@ struct LRUCacheOptions {
   CacheMetadataChargePolicy metadata_charge_policy =
       kDefaultCacheMetadataChargePolicy;
 
+  // Enables quickMRC stack-distance histogram sampling in LRU cache.
+  bool quick_mrc_enabled = false;
+
+  // Maximum number of entries in a quickMRC recency bucket.
+  uint32_t quick_mrc_max_bucket_size = 60;
+
+  // Ghost-cache capacity multiplier relative to shard capacity.
+  uint32_t quick_mrc_ghost_cache_multiplier = 1;
+
+  // Sampling probability in [0.0, 1.0].
+  double quick_mrc_sampling_rate = 0.01;
+
+  // Histogram bin size used for exported stack-distance histogram.
+  uint32_t quick_mrc_histogram_bin_size = 1024;
+
   LRUCacheOptions() {}
   LRUCacheOptions(size_t _capacity, int _num_shard_bits,
                   bool _strict_capacity_limit, double _high_pri_pool_ratio,
                   std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr,
                   bool _use_adaptive_mutex = kDefaultToAdaptiveMutex,
                   CacheMetadataChargePolicy _metadata_charge_policy =
-                      kDefaultCacheMetadataChargePolicy)
+                      kDefaultCacheMetadataChargePolicy,
+                  bool _quick_mrc_enabled = false,
+                  uint32_t _quick_mrc_max_bucket_size = 60,
+                  uint32_t _quick_mrc_ghost_cache_multiplier = 1,
+                  double _quick_mrc_sampling_rate = 0.01,
+                  uint32_t _quick_mrc_histogram_bin_size = 1024)
       : capacity(_capacity),
         num_shard_bits(_num_shard_bits),
         strict_capacity_limit(_strict_capacity_limit),
         high_pri_pool_ratio(_high_pri_pool_ratio),
         memory_allocator(std::move(_memory_allocator)),
         use_adaptive_mutex(_use_adaptive_mutex),
-        metadata_charge_policy(_metadata_charge_policy) {}
+        metadata_charge_policy(_metadata_charge_policy),
+        quick_mrc_enabled(_quick_mrc_enabled),
+        quick_mrc_max_bucket_size(_quick_mrc_max_bucket_size),
+        quick_mrc_ghost_cache_multiplier(_quick_mrc_ghost_cache_multiplier),
+        quick_mrc_sampling_rate(_quick_mrc_sampling_rate),
+        quick_mrc_histogram_bin_size(_quick_mrc_histogram_bin_size) {}
 };
 
 // Create a new cache with a fixed size capacity. The cache is sharded
@@ -117,7 +143,11 @@ extern std::shared_ptr<Cache> NewLRUCache(
     std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
     bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
     CacheMetadataChargePolicy metadata_charge_policy =
-        kDefaultCacheMetadataChargePolicy);
+        kDefaultCacheMetadataChargePolicy,
+    bool quick_mrc_enabled = false, uint32_t quick_mrc_max_bucket_size = 60,
+    uint32_t quick_mrc_ghost_cache_multiplier = 1,
+    double quick_mrc_sampling_rate = 0.01,
+    uint32_t quick_mrc_histogram_bin_size = 1024);
 
 extern std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts);
 
@@ -284,6 +314,12 @@ class Cache {
   virtual void EraseUnRefEntries() = 0;
 
   virtual std::string GetPrintableOptions() const { return ""; }
+
+  virtual std::vector<uint64_t> GetQuickMRCStackDistanceHistogram() const {
+    return {};
+  }
+
+  virtual void ResetQuickMRCStats() {}
 
   MemoryAllocator* memory_allocator() const { return memory_allocator_.get(); }
 

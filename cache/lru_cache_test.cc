@@ -32,7 +32,12 @@ class LRUCacheTest : public testing::Test {
         port::cacheline_aligned_alloc(sizeof(LRUCacheShard)));
     new (cache_) LRUCacheShard(capacity, false /*strict_capacity_limit*/,
                                high_pri_pool_ratio, use_adaptive_mutex,
-                               kDontChargeCacheMetadata);
+                               kDontChargeCacheMetadata,
+                               true /*quick_mrc_enabled*/,
+                               60 /*quick_mrc_max_bucket_size*/,
+                               1 /*quick_mrc_ghost_cache_multiplier*/,
+                               1.0 /*quick_mrc_sampling_rate*/,
+                               1 /*quick_mrc_histogram_bin_size*/);
   }
 
   void Insert(const std::string& key,
@@ -189,6 +194,27 @@ TEST_F(LRUCacheTest, EntriesWithPriority) {
   ValidateLRUList({"d", "e", "f", "g", "Z"}, 1);
   ASSERT_TRUE(Lookup("d"));
   ValidateLRUList({"e", "f", "g", "Z", "d"}, 2);
+}
+
+TEST_F(LRUCacheTest, QuickMRCHistogramTracksHitsAndGhostHits) {
+  NewCache(3);
+  Insert("a");
+  Insert("b");
+  Insert("c");
+
+  ASSERT_TRUE(Lookup("a"));
+  Insert("d");  // evicts oldest
+  ASSERT_FALSE(Lookup("b"));
+
+  std::vector<uint64_t> histogram = cache_->GetQuickMRCStackDistanceHistogram();
+  ASSERT_FALSE(histogram.empty());
+  uint64_t total = 0;
+  for (uint64_t count : histogram) {
+    total += count;
+  }
+  ASSERT_GE(total, 2U);
+  cache_->ResetQuickMRCStats();
+  ASSERT_TRUE(cache_->GetQuickMRCStackDistanceHistogram().empty());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

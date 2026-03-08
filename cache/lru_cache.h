@@ -8,7 +8,11 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 
+#include <deque>
+#include <list>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "cache/sharded_cache.h"
 
@@ -72,6 +76,10 @@ struct LRUHandle {
   };
 
   uint8_t flags;
+
+  // quickMRC metadata for bucketed stack distance approximation.
+  uint64_t quick_mrc_bucket_id = 0;
+  bool quick_mrc_in_bucket = false;
 
   // Beginning of the key (MUST BE THE LAST FIELD IN THIS STRUCT!)
   char key_data[1];
@@ -193,7 +201,11 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
  public:
   LRUCacheShard(size_t capacity, bool strict_capacity_limit,
                 double high_pri_pool_ratio, bool use_adaptive_mutex,
-                CacheMetadataChargePolicy metadata_charge_policy);
+                CacheMetadataChargePolicy metadata_charge_policy,
+                bool quick_mrc_enabled, uint32_t quick_mrc_max_bucket_size,
+                uint32_t quick_mrc_ghost_cache_multiplier,
+                double quick_mrc_sampling_rate,
+                uint32_t quick_mrc_histogram_bin_size);
   virtual ~LRUCacheShard() override = default;
 
   // Separate from constructor so caller can easily make an array of LRUCache
@@ -233,6 +245,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
 
   virtual std::string GetPrintableOptions() const override;
 
+  std::vector<uint64_t> GetQuickMRCStackDistanceHistogram() const;
+  void ResetQuickMRCStats();
+
   void TEST_GetLRUList(LRUHandle** lru, LRUHandle** lru_low_pri);
 
   //  Retrieves number of elements in LRU, for unit test purpose only
@@ -243,6 +258,28 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   double GetHighPriPoolRatio();
 
  private:
+  struct QuickMRCBucket {
+    uint64_t id = 0;
+    size_t size = 0;
+  };
+
+  struct QuickMRCGhostEntry {
+    uint64_t bucket_id = 0;
+    std::list<std::string>::iterator lru_iter;
+  };
+
+  void QuickMRCEnsureFrontBucket(std::deque<QuickMRCBucket>* buckets);
+  size_t QuickMRCEstimateDistance(uint64_t bucket_id,
+                                  const std::deque<QuickMRCBucket>& buckets,
+                                  bool* found) const;
+  void QuickMRCRecordDistance(size_t stack_distance);
+  bool QuickMRCShouldSample(uint32_t hash) const;
+  void QuickMRCRemoveCacheHandleFromBucket(LRUHandle* e);
+  void QuickMRCTouchCacheHandle(LRUHandle* e);
+  void QuickMRCInsertGhost(const Slice& key);
+  bool QuickMRCProbeGhost(const Slice& key, uint32_t hash);
+  void QuickMRCEnforceGhostCapacity();
+
   void LRU_Remove(LRUHandle* e);
   void LRU_Insert(LRUHandle* e);
 
@@ -303,6 +340,21 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   // We don't count mutex_ as the cache's internal state so semantically we
   // don't mind mutex_ invoking the non-const actions.
   mutable port::Mutex mutex_;
+
+  // quickMRC config
+  bool quick_mrc_enabled_;
+  uint32_t quick_mrc_max_bucket_size_;
+  uint32_t quick_mrc_ghost_cache_multiplier_;
+  double quick_mrc_sampling_rate_;
+  uint32_t quick_mrc_sampling_denominator_;
+  uint32_t quick_mrc_histogram_bin_size_;
+  uint64_t quick_mrc_next_bucket_id_;
+  size_t quick_mrc_resident_entries_;
+  std::deque<QuickMRCBucket> quick_mrc_cache_buckets_;
+  std::deque<QuickMRCBucket> quick_mrc_ghost_buckets_;
+  std::unordered_map<std::string, QuickMRCGhostEntry> quick_mrc_ghost_index_;
+  std::list<std::string> quick_mrc_ghost_lru_;
+  std::vector<uint64_t> quick_mrc_histogram_;
 };
 
 class LRUCache
@@ -316,7 +368,12 @@ class LRUCache
            std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
            bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
            CacheMetadataChargePolicy metadata_charge_policy =
-               kDontChargeCacheMetadata);
+               kDontChargeCacheMetadata,
+           bool quick_mrc_enabled = false,
+           uint32_t quick_mrc_max_bucket_size = 60,
+           uint32_t quick_mrc_ghost_cache_multiplier = 1,
+           double quick_mrc_sampling_rate = 0.01,
+           uint32_t quick_mrc_histogram_bin_size = 1024);
   virtual ~LRUCache();
   virtual const char* Name() const override { return "LRUCache"; }
   virtual CacheShard* GetShard(int shard) override;
@@ -330,6 +387,10 @@ class LRUCache
   size_t TEST_GetLRUSize();
   //  Retrieves high pri pool ratio
   double GetHighPriPoolRatio();
+
+  virtual std::vector<uint64_t> GetQuickMRCStackDistanceHistogram()
+      const override;
+  virtual void ResetQuickMRCStats() override;
 
  private:
   LRUCacheShard* shards_ = nullptr;

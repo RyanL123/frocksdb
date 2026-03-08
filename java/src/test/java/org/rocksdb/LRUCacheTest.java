@@ -28,4 +28,26 @@ public class LRUCacheTest {
       assertThat(lruCache.getPinnedUsage()).isGreaterThanOrEqualTo(0);
     }
   }
+
+  @Test
+  public void newLRUCacheWithQuickMRC() {
+    final long capacity = 80000000;
+    final int numShardBits = 4;
+    final boolean strictCapacityLimit = false;
+    final double highPriPoolRatio = 0.0;
+    final boolean quickMrcEnabled = true;
+    final int quickMrcMaxBucketSize = 60;
+    final int quickMrcGhostCacheMultiplier = 1;
+    final double quickMrcSamplingRate = 0.01;
+    final int quickMrcHistogramBinSize = 1024;
+    try (final LRUCache lruCache = new LRUCache(capacity, numShardBits,
+        strictCapacityLimit, highPriPoolRatio, quickMrcEnabled,
+        quickMrcMaxBucketSize, quickMrcGhostCacheMultiplier,
+        quickMrcSamplingRate, quickMrcHistogramBinSize)) {
+      final long[] histogram = lruCache.getStackDistanceHistogram();
+      assertThat(histogram).isNotNull();
+      lruCache.resetQuickMRCStats();
+      assertThat(lruCache.getStackDistanceHistogram()).isNotNull();
+    }
+  }
 }

@@ -75,8 +75,57 @@ public class LRUCache extends Cache {
         highPriPoolRatio));
   }
 
+  /**
+   * Create a new cache with explicit quickMRC settings.
+   *
+   * @param capacity The fixed size capacity of the cache
+   * @param numShardBits The cache is sharded to 2^numShardBits shards
+   * @param strictCapacityLimit insert to the cache will fail when cache is full
+   * @param highPriPoolRatio percentage of the cache reserved for high priority entries
+   * @param quickMrcEnabled whether quickMRC stack-distance sampling is enabled
+   * @param quickMrcMaxBucketSize max quickMRC bucket size
+   * @param quickMrcGhostCacheMultiplier ghost-cache size multiplier
+   * @param quickMrcSamplingRate sampling probability in [0, 1]
+   * @param quickMrcHistogramBinSize exported histogram bin size
+   */
+  public LRUCache(final long capacity, final int numShardBits,
+      final boolean strictCapacityLimit, final double highPriPoolRatio,
+      final boolean quickMrcEnabled, final int quickMrcMaxBucketSize,
+      final int quickMrcGhostCacheMultiplier, final double quickMrcSamplingRate,
+      final int quickMrcHistogramBinSize) {
+    super(newLRUCacheWithQuickMRC(capacity, numShardBits, strictCapacityLimit,
+        highPriPoolRatio, quickMrcEnabled, quickMrcMaxBucketSize,
+        quickMrcGhostCacheMultiplier, quickMrcSamplingRate,
+        quickMrcHistogramBinSize));
+  }
+
+  /**
+   * Returns stack-distance histogram counts binned by configured bin size.
+   *
+   * @return histogram bucket counts
+   */
+  public long[] getStackDistanceHistogram() {
+    assert (isOwningHandle());
+    return getStackDistanceHistogram(this.nativeHandle_);
+  }
+
+  /**
+   * Resets collected quickMRC histogram statistics.
+   */
+  public void resetQuickMRCStats() {
+    assert (isOwningHandle());
+    resetQuickMRCStats(this.nativeHandle_);
+  }
+
   private native static long newLRUCache(final long capacity,
       final int numShardBits, final boolean strictCapacityLimit,
       final double highPriPoolRatio);
+  private native static long newLRUCacheWithQuickMRC(final long capacity,
+      final int numShardBits, final boolean strictCapacityLimit,
+      final double highPriPoolRatio, final boolean quickMrcEnabled,
+      final int quickMrcMaxBucketSize, final int quickMrcGhostCacheMultiplier,
+      final double quickMrcSamplingRate, final int quickMrcHistogramBinSize);
+  private native static long[] getStackDistanceHistogram(final long handle);
+  private native static void resetQuickMRCStats(final long handle);
   @Override protected final native void disposeInternal(final long handle);
 }

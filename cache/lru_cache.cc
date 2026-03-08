@@ -10,6 +10,7 @@
 #include "cache/lru_cache.h"
 
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -97,7 +98,12 @@ void LRUHandleTable::Resize() {
 LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
                              double high_pri_pool_ratio,
                              bool use_adaptive_mutex,
-                             CacheMetadataChargePolicy metadata_charge_policy)
+                             CacheMetadataChargePolicy metadata_charge_policy,
+                             bool quick_mrc_enabled,
+                             uint32_t quick_mrc_max_bucket_size,
+                             uint32_t quick_mrc_ghost_cache_multiplier,
+                             double quick_mrc_sampling_rate,
+                             uint32_t quick_mrc_histogram_bin_size)
     : capacity_(0),
       high_pri_pool_usage_(0),
       strict_capacity_limit_(strict_capacity_limit),
@@ -105,13 +111,207 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
       high_pri_pool_capacity_(0),
       usage_(0),
       lru_usage_(0),
-      mutex_(use_adaptive_mutex) {
+      mutex_(use_adaptive_mutex),
+      quick_mrc_enabled_(quick_mrc_enabled),
+      quick_mrc_max_bucket_size_(quick_mrc_max_bucket_size),
+      quick_mrc_ghost_cache_multiplier_(quick_mrc_ghost_cache_multiplier),
+      quick_mrc_sampling_rate_(quick_mrc_sampling_rate),
+      quick_mrc_sampling_denominator_(0),
+      quick_mrc_histogram_bin_size_(quick_mrc_histogram_bin_size),
+      quick_mrc_next_bucket_id_(1),
+      quick_mrc_resident_entries_(0) {
   set_metadata_charge_policy(metadata_charge_policy);
+  if (quick_mrc_sampling_rate_ >= 1.0) {
+    quick_mrc_sampling_denominator_ = 1;
+  } else if (quick_mrc_sampling_rate_ > 0.0) {
+    quick_mrc_sampling_denominator_ =
+        static_cast<uint32_t>(std::ceil(1.0 / quick_mrc_sampling_rate_));
+    if (quick_mrc_sampling_denominator_ == 0) {
+      quick_mrc_sampling_denominator_ = 1;
+    }
+  }
   // Make empty circular linked list
   lru_.next = &lru_;
   lru_.prev = &lru_;
   lru_low_pri_ = &lru_;
   SetCapacity(capacity);
+}
+
+void LRUCacheShard::QuickMRCEnsureFrontBucket(
+    std::deque<QuickMRCBucket>* buckets) {
+  if (buckets->empty() || buckets->front().size >= quick_mrc_max_bucket_size_) {
+    QuickMRCBucket bucket;
+    bucket.id = quick_mrc_next_bucket_id_++;
+    bucket.size = 0;
+    buckets->push_front(bucket);
+  }
+}
+
+size_t LRUCacheShard::QuickMRCEstimateDistance(
+    uint64_t bucket_id, const std::deque<QuickMRCBucket>& buckets,
+    bool* found) const {
+  size_t distance = 0;
+  *found = false;
+  for (const auto& bucket : buckets) {
+    distance += bucket.size;
+    if (bucket.id == bucket_id) {
+      *found = true;
+      break;
+    }
+  }
+  return distance;
+}
+
+void LRUCacheShard::QuickMRCRecordDistance(size_t stack_distance) {
+  if (quick_mrc_histogram_bin_size_ == 0) {
+    return;
+  }
+  const size_t bin = stack_distance / quick_mrc_histogram_bin_size_;
+  if (quick_mrc_histogram_.size() <= bin) {
+    quick_mrc_histogram_.resize(bin + 1, 0);
+  }
+  quick_mrc_histogram_[bin]++;
+}
+
+bool LRUCacheShard::QuickMRCShouldSample(uint32_t hash) const {
+  if (!quick_mrc_enabled_ || quick_mrc_sampling_denominator_ == 0) {
+    return false;
+  }
+  return (hash % quick_mrc_sampling_denominator_) == 0;
+}
+
+void LRUCacheShard::QuickMRCRemoveCacheHandleFromBucket(LRUHandle* e) {
+  if (!quick_mrc_enabled_ || !e->quick_mrc_in_bucket) {
+    return;
+  }
+  for (auto it = quick_mrc_cache_buckets_.begin();
+       it != quick_mrc_cache_buckets_.end(); ++it) {
+    if (it->id == e->quick_mrc_bucket_id) {
+      assert(it->size > 0);
+      it->size--;
+      if (it->size == 0) {
+        quick_mrc_cache_buckets_.erase(it);
+      }
+      break;
+    }
+  }
+  e->quick_mrc_in_bucket = false;
+}
+
+void LRUCacheShard::QuickMRCTouchCacheHandle(LRUHandle* e) {
+  if (!quick_mrc_enabled_) {
+    return;
+  }
+  QuickMRCRemoveCacheHandleFromBucket(e);
+  QuickMRCEnsureFrontBucket(&quick_mrc_cache_buckets_);
+  e->quick_mrc_bucket_id = quick_mrc_cache_buckets_.front().id;
+  e->quick_mrc_in_bucket = true;
+  quick_mrc_cache_buckets_.front().size++;
+}
+
+void LRUCacheShard::QuickMRCInsertGhost(const Slice& key) {
+  if (!quick_mrc_enabled_ || quick_mrc_ghost_cache_multiplier_ == 0) {
+    return;
+  }
+
+  const std::string key_str = key.ToString();
+  auto existing = quick_mrc_ghost_index_.find(key_str);
+  if (existing != quick_mrc_ghost_index_.end()) {
+    for (auto it = quick_mrc_ghost_buckets_.begin();
+         it != quick_mrc_ghost_buckets_.end(); ++it) {
+      if (it->id == existing->second.bucket_id) {
+        assert(it->size > 0);
+        it->size--;
+        if (it->size == 0) {
+          quick_mrc_ghost_buckets_.erase(it);
+        }
+        break;
+      }
+    }
+    quick_mrc_ghost_lru_.erase(existing->second.lru_iter);
+    quick_mrc_ghost_index_.erase(existing);
+  }
+
+  QuickMRCEnsureFrontBucket(&quick_mrc_ghost_buckets_);
+  quick_mrc_ghost_buckets_.front().size++;
+  quick_mrc_ghost_lru_.push_front(key_str);
+  QuickMRCGhostEntry ghost_entry;
+  ghost_entry.bucket_id = quick_mrc_ghost_buckets_.front().id;
+  ghost_entry.lru_iter = quick_mrc_ghost_lru_.begin();
+  quick_mrc_ghost_index_[key_str] = ghost_entry;
+  QuickMRCEnforceGhostCapacity();
+}
+
+bool LRUCacheShard::QuickMRCProbeGhost(const Slice& key, uint32_t hash) {
+  if (!quick_mrc_enabled_ || quick_mrc_ghost_cache_multiplier_ == 0) {
+    return false;
+  }
+  auto it = quick_mrc_ghost_index_.find(key.ToString());
+  if (it == quick_mrc_ghost_index_.end()) {
+    return false;
+  }
+
+  if (QuickMRCShouldSample(hash)) {
+    bool found = false;
+    size_t ghost_distance =
+        QuickMRCEstimateDistance(it->second.bucket_id, quick_mrc_ghost_buckets_,
+                                 &found);
+    if (found) {
+      QuickMRCRecordDistance(quick_mrc_resident_entries_ + ghost_distance);
+    }
+  }
+
+  for (auto bucket_it = quick_mrc_ghost_buckets_.begin();
+       bucket_it != quick_mrc_ghost_buckets_.end(); ++bucket_it) {
+    if (bucket_it->id == it->second.bucket_id) {
+      assert(bucket_it->size > 0);
+      bucket_it->size--;
+      if (bucket_it->size == 0) {
+        quick_mrc_ghost_buckets_.erase(bucket_it);
+      }
+      break;
+    }
+  }
+
+  quick_mrc_ghost_lru_.erase(it->second.lru_iter);
+  quick_mrc_ghost_index_.erase(it);
+
+  QuickMRCEnsureFrontBucket(&quick_mrc_ghost_buckets_);
+  quick_mrc_ghost_buckets_.front().size++;
+  quick_mrc_ghost_lru_.push_front(key.ToString());
+  QuickMRCGhostEntry ghost_entry;
+  ghost_entry.bucket_id = quick_mrc_ghost_buckets_.front().id;
+  ghost_entry.lru_iter = quick_mrc_ghost_lru_.begin();
+  quick_mrc_ghost_index_[key.ToString()] = ghost_entry;
+  return true;
+}
+
+void LRUCacheShard::QuickMRCEnforceGhostCapacity() {
+  if (!quick_mrc_enabled_ || quick_mrc_ghost_cache_multiplier_ == 0) {
+    return;
+  }
+  const size_t ghost_capacity =
+      quick_mrc_resident_entries_ * quick_mrc_ghost_cache_multiplier_;
+  while (quick_mrc_ghost_index_.size() > ghost_capacity &&
+         !quick_mrc_ghost_lru_.empty()) {
+    const std::string& key = quick_mrc_ghost_lru_.back();
+    auto it = quick_mrc_ghost_index_.find(key);
+    if (it != quick_mrc_ghost_index_.end()) {
+      for (auto bucket_it = quick_mrc_ghost_buckets_.begin();
+           bucket_it != quick_mrc_ghost_buckets_.end(); ++bucket_it) {
+        if (bucket_it->id == it->second.bucket_id) {
+          assert(bucket_it->size > 0);
+          bucket_it->size--;
+          if (bucket_it->size == 0) {
+            quick_mrc_ghost_buckets_.erase(bucket_it);
+          }
+          break;
+        }
+      }
+      quick_mrc_ghost_index_.erase(it);
+    }
+    quick_mrc_ghost_lru_.pop_back();
+  }
 }
 
 void LRUCacheShard::EraseUnRefEntries() {
@@ -125,6 +325,13 @@ void LRUCacheShard::EraseUnRefEntries() {
       LRU_Remove(old);
       table_.Remove(old->key(), old->hash);
       old->SetInCache(false);
+      if (quick_mrc_enabled_) {
+        QuickMRCRemoveCacheHandleFromBucket(old);
+        if (quick_mrc_resident_entries_ > 0) {
+          quick_mrc_resident_entries_--;
+        }
+        QuickMRCEnforceGhostCapacity();
+      }
       size_t total_charge = old->CalcTotalCharge(metadata_charge_policy_);
       assert(usage_ >= total_charge);
       usage_ -= total_charge;
@@ -240,6 +447,13 @@ void LRUCacheShard::EvictFromLRU(size_t charge,
     LRU_Remove(old);
     table_.Remove(old->key(), old->hash);
     old->SetInCache(false);
+    if (quick_mrc_enabled_) {
+      QuickMRCRemoveCacheHandleFromBucket(old);
+      if (quick_mrc_resident_entries_ > 0) {
+        quick_mrc_resident_entries_--;
+      }
+      QuickMRCInsertGhost(old->key());
+    }
     size_t old_total_charge = old->CalcTotalCharge(metadata_charge_policy_);
     assert(usage_ >= old_total_charge);
     usage_ -= old_total_charge;
@@ -271,6 +485,17 @@ Cache::Handle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash) {
   MutexLock l(&mutex_);
   LRUHandle* e = table_.Lookup(key, hash);
   if (e != nullptr) {
+    if (quick_mrc_enabled_ && QuickMRCShouldSample(hash)) {
+      bool found = false;
+      size_t stack_distance = QuickMRCEstimateDistance(
+          e->quick_mrc_bucket_id, quick_mrc_cache_buckets_, &found);
+      if (found) {
+        QuickMRCRecordDistance(stack_distance);
+      }
+    }
+    if (quick_mrc_enabled_) {
+      QuickMRCTouchCacheHandle(e);
+    }
     assert(e->InCache());
     if (!e->HasRefs()) {
       // The entry is in LRU since it's in hash and has no external references
@@ -278,6 +503,8 @@ Cache::Handle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash) {
     }
     e->Ref();
     e->SetHit();
+  } else if (quick_mrc_enabled_) {
+    QuickMRCProbeGhost(key, hash);
   }
   return reinterpret_cast<Cache::Handle*>(e);
 }
@@ -315,6 +542,13 @@ bool LRUCacheShard::Release(Cache::Handle* handle, bool force_erase) {
         // Take this opportunity and remove the item
         table_.Remove(e->key(), e->hash);
         e->SetInCache(false);
+        if (quick_mrc_enabled_) {
+          QuickMRCRemoveCacheHandleFromBucket(e);
+          if (quick_mrc_resident_entries_ > 0) {
+            quick_mrc_resident_entries_--;
+          }
+          QuickMRCInsertGhost(e->key());
+        }
       } else {
         // Put the item back on the LRU list, and don't free it
         LRU_Insert(e);
@@ -384,10 +618,21 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
       // capacity if not enough space was freed up.
       LRUHandle* old = table_.Insert(e);
       usage_ += total_charge;
+      if (quick_mrc_enabled_) {
+        quick_mrc_resident_entries_++;
+        QuickMRCTouchCacheHandle(e);
+      }
       if (old != nullptr) {
         s = Status::OkOverwritten();
         assert(old->InCache());
         old->SetInCache(false);
+        if (quick_mrc_enabled_) {
+          QuickMRCRemoveCacheHandleFromBucket(old);
+          if (quick_mrc_resident_entries_ > 0) {
+            quick_mrc_resident_entries_--;
+          }
+          QuickMRCInsertGhost(old->key());
+        }
         if (!old->HasRefs()) {
           // old is on LRU because it's in cache and its reference count is 0
           LRU_Remove(old);
@@ -424,6 +669,13 @@ void LRUCacheShard::Erase(const Slice& key, uint32_t hash) {
     if (e != nullptr) {
       assert(e->InCache());
       e->SetInCache(false);
+      if (quick_mrc_enabled_) {
+        QuickMRCRemoveCacheHandleFromBucket(e);
+        if (quick_mrc_resident_entries_ > 0) {
+          quick_mrc_resident_entries_--;
+        }
+        QuickMRCInsertGhost(e->key());
+      }
       if (!e->HasRefs()) {
         // The entry is in LRU since it's in hash and has no external references
         LRU_Remove(e);
@@ -454,21 +706,43 @@ size_t LRUCacheShard::GetPinnedUsage() const {
 }
 
 std::string LRUCacheShard::GetPrintableOptions() const {
-  const int kBufferSize = 200;
+  const int kBufferSize = 512;
   char buffer[kBufferSize];
   {
     MutexLock l(&mutex_);
-    snprintf(buffer, kBufferSize, "    high_pri_pool_ratio: %.3lf\n",
-             high_pri_pool_ratio_);
+    snprintf(buffer, kBufferSize,
+             "    high_pri_pool_ratio: %.3lf\n"
+             "    quick_mrc_enabled: %d\n"
+             "    quick_mrc_max_bucket_size: %u\n"
+             "    quick_mrc_ghost_cache_multiplier: %u\n"
+             "    quick_mrc_sampling_rate: %.6lf\n"
+             "    quick_mrc_histogram_bin_size: %u\n",
+             high_pri_pool_ratio_, static_cast<int>(quick_mrc_enabled_),
+             quick_mrc_max_bucket_size_, quick_mrc_ghost_cache_multiplier_,
+             quick_mrc_sampling_rate_, quick_mrc_histogram_bin_size_);
   }
   return std::string(buffer);
+}
+
+std::vector<uint64_t> LRUCacheShard::GetQuickMRCStackDistanceHistogram() const {
+  MutexLock l(&mutex_);
+  return quick_mrc_histogram_;
+}
+
+void LRUCacheShard::ResetQuickMRCStats() {
+  MutexLock l(&mutex_);
+  quick_mrc_histogram_.clear();
 }
 
 LRUCache::LRUCache(size_t capacity, int num_shard_bits,
                    bool strict_capacity_limit, double high_pri_pool_ratio,
                    std::shared_ptr<MemoryAllocator> allocator,
                    bool use_adaptive_mutex,
-                   CacheMetadataChargePolicy metadata_charge_policy)
+                   CacheMetadataChargePolicy metadata_charge_policy,
+                   bool quick_mrc_enabled, uint32_t quick_mrc_max_bucket_size,
+                   uint32_t quick_mrc_ghost_cache_multiplier,
+                   double quick_mrc_sampling_rate,
+                   uint32_t quick_mrc_histogram_bin_size)
     : ShardedCache(capacity, num_shard_bits, strict_capacity_limit,
                    std::move(allocator)) {
   num_shards_ = 1 << num_shard_bits;
@@ -478,7 +752,10 @@ LRUCache::LRUCache(size_t capacity, int num_shard_bits,
   for (int i = 0; i < num_shards_; i++) {
     new (&shards_[i])
         LRUCacheShard(per_shard, strict_capacity_limit, high_pri_pool_ratio,
-                      use_adaptive_mutex, metadata_charge_policy);
+                      use_adaptive_mutex, metadata_charge_policy,
+                      quick_mrc_enabled, quick_mrc_max_bucket_size,
+                      quick_mrc_ghost_cache_multiplier, quick_mrc_sampling_rate,
+                      quick_mrc_histogram_bin_size);
   }
 }
 
@@ -543,19 +820,48 @@ double LRUCache::GetHighPriPoolRatio() {
   return result;
 }
 
+std::vector<uint64_t> LRUCache::GetQuickMRCStackDistanceHistogram() const {
+  std::vector<uint64_t> merged;
+  for (int i = 0; i < num_shards_; i++) {
+    std::vector<uint64_t> shard_hist =
+        shards_[i].GetQuickMRCStackDistanceHistogram();
+    if (merged.size() < shard_hist.size()) {
+      merged.resize(shard_hist.size(), 0);
+    }
+    for (size_t j = 0; j < shard_hist.size(); j++) {
+      merged[j] += shard_hist[j];
+    }
+  }
+  return merged;
+}
+
+void LRUCache::ResetQuickMRCStats() {
+  for (int i = 0; i < num_shards_; i++) {
+    shards_[i].ResetQuickMRCStats();
+  }
+}
+
 std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts) {
   return NewLRUCache(cache_opts.capacity, cache_opts.num_shard_bits,
                      cache_opts.strict_capacity_limit,
                      cache_opts.high_pri_pool_ratio,
                      cache_opts.memory_allocator, cache_opts.use_adaptive_mutex,
-                     cache_opts.metadata_charge_policy);
+                     cache_opts.metadata_charge_policy,
+                     cache_opts.quick_mrc_enabled,
+                     cache_opts.quick_mrc_max_bucket_size,
+                     cache_opts.quick_mrc_ghost_cache_multiplier,
+                     cache_opts.quick_mrc_sampling_rate,
+                     cache_opts.quick_mrc_histogram_bin_size);
 }
 
 std::shared_ptr<Cache> NewLRUCache(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
     std::shared_ptr<MemoryAllocator> memory_allocator, bool use_adaptive_mutex,
-    CacheMetadataChargePolicy metadata_charge_policy) {
+    CacheMetadataChargePolicy metadata_charge_policy, bool quick_mrc_enabled,
+    uint32_t quick_mrc_max_bucket_size,
+    uint32_t quick_mrc_ghost_cache_multiplier, double quick_mrc_sampling_rate,
+    uint32_t quick_mrc_histogram_bin_size) {
   if (num_shard_bits >= 20) {
     return nullptr;  // the cache cannot be sharded into too many fine pieces
   }
@@ -563,12 +869,21 @@ std::shared_ptr<Cache> NewLRUCache(
     // invalid high_pri_pool_ratio
     return nullptr;
   }
+  if (quick_mrc_max_bucket_size == 0 ||
+      quick_mrc_ghost_cache_multiplier == 0 ||
+      quick_mrc_histogram_bin_size == 0 || quick_mrc_sampling_rate < 0.0 ||
+      quick_mrc_sampling_rate > 1.0) {
+    return nullptr;
+  }
   if (num_shard_bits < 0) {
     num_shard_bits = GetDefaultCacheShardBits(capacity);
   }
   return std::make_shared<LRUCache>(
       capacity, num_shard_bits, strict_capacity_limit, high_pri_pool_ratio,
-      std::move(memory_allocator), use_adaptive_mutex, metadata_charge_policy);
+      std::move(memory_allocator), use_adaptive_mutex, metadata_charge_policy,
+      quick_mrc_enabled, quick_mrc_max_bucket_size,
+      quick_mrc_ghost_cache_multiplier, quick_mrc_sampling_rate,
+      quick_mrc_histogram_bin_size);
 }
 
 }  // namespace ROCKSDB_NAMESPACE
