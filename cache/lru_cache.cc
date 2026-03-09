@@ -162,7 +162,8 @@ size_t LRUCacheShard::QuickMRCEstimateDistance(
   return distance;
 }
 
-void LRUCacheShard::QuickMRCRecordDistance(size_t stack_distance) {
+void LRUCacheShard::QuickMRCRecordDistance(size_t stack_distance,
+                                           uint64_t weight) {
   if (quick_mrc_histogram_bin_size_ == 0) {
     return;
   }
@@ -170,7 +171,7 @@ void LRUCacheShard::QuickMRCRecordDistance(size_t stack_distance) {
   if (quick_mrc_histogram_.size() <= bin) {
     quick_mrc_histogram_.resize(bin + 1, 0);
   }
-  quick_mrc_histogram_[bin]++;
+  quick_mrc_histogram_[bin] += weight;
 }
 
 bool LRUCacheShard::QuickMRCShouldSample(uint32_t hash) const {
@@ -242,7 +243,7 @@ void LRUCacheShard::QuickMRCInsertGhost(const Slice& key) {
   QuickMRCEnforceGhostCapacity();
 }
 
-bool LRUCacheShard::QuickMRCProbeGhost(const Slice& key, uint32_t hash) {
+bool LRUCacheShard::QuickMRCProbeGhost(const Slice& key) {
   if (!quick_mrc_enabled_ || quick_mrc_ghost_cache_multiplier_ == 0) {
     return false;
   }
@@ -251,14 +252,13 @@ bool LRUCacheShard::QuickMRCProbeGhost(const Slice& key, uint32_t hash) {
     return false;
   }
 
-  if (QuickMRCShouldSample(hash)) {
-    bool found = false;
-    size_t ghost_distance =
-        QuickMRCEstimateDistance(it->second.bucket_id, quick_mrc_ghost_buckets_,
-                                 &found);
-    if (found) {
-      QuickMRCRecordDistance(quick_mrc_resident_entries_ + ghost_distance);
-    }
+  bool found = false;
+  size_t ghost_distance =
+      QuickMRCEstimateDistance(it->second.bucket_id, quick_mrc_ghost_buckets_,
+                               &found);
+  if (found) {
+    // Ghost cache observations are always recorded (not sampled).
+    QuickMRCRecordDistance(quick_mrc_resident_entries_ + ghost_distance);
   }
 
   for (auto bucket_it = quick_mrc_ghost_buckets_.begin();
@@ -490,7 +490,12 @@ Cache::Handle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash) {
       size_t stack_distance = QuickMRCEstimateDistance(
           e->quick_mrc_bucket_id, quick_mrc_cache_buckets_, &found);
       if (found) {
-        QuickMRCRecordDistance(stack_distance);
+        // Scale sampled LRU observations by K; stack distance is unchanged.
+        const uint64_t sample_weight =
+            (quick_mrc_sampling_denominator_ == 0)
+                ? 1
+                : static_cast<uint64_t>(quick_mrc_sampling_denominator_);
+        QuickMRCRecordDistance(stack_distance, sample_weight);
       }
     }
     if (quick_mrc_enabled_) {
@@ -504,7 +509,7 @@ Cache::Handle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash) {
     e->Ref();
     e->SetHit();
   } else if (quick_mrc_enabled_) {
-    QuickMRCProbeGhost(key, hash);
+    QuickMRCProbeGhost(key);
   }
   return reinterpret_cast<Cache::Handle*>(e);
 }

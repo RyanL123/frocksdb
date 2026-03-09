@@ -272,12 +272,12 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   size_t QuickMRCEstimateDistance(uint64_t bucket_id,
                                   const std::deque<QuickMRCBucket>& buckets,
                                   bool* found) const;
-  void QuickMRCRecordDistance(size_t stack_distance);
+  void QuickMRCRecordDistance(size_t stack_distance, uint64_t weight = 1);
   bool QuickMRCShouldSample(uint32_t hash) const;
   void QuickMRCRemoveCacheHandleFromBucket(LRUHandle* e);
   void QuickMRCTouchCacheHandle(LRUHandle* e);
   void QuickMRCInsertGhost(const Slice& key);
-  bool QuickMRCProbeGhost(const Slice& key, uint32_t hash);
+  bool QuickMRCProbeGhost(const Slice& key);
   void QuickMRCEnforceGhostCapacity();
 
   void LRU_Remove(LRUHandle* e);
