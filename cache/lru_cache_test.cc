@@ -209,12 +209,27 @@ TEST_F(LRUCacheTest, QuickMRCHistogramTracksHitsAndGhostHits) {
   std::vector<uint64_t> histogram = cache_->GetQuickMRCStackDistanceHistogram();
   ASSERT_FALSE(histogram.empty());
   uint64_t total = 0;
-  for (uint64_t count : histogram) {
-    total += count;
+  for (size_t i = 0; i + 1 < histogram.size(); ++i) {
+    total += histogram[i];
   }
   ASSERT_GE(total, 2U);
   cache_->ResetQuickMRCStats();
-  ASSERT_TRUE(cache_->GetQuickMRCStackDistanceHistogram().empty());
+  std::vector<uint64_t> reset_hist = cache_->GetQuickMRCStackDistanceHistogram();
+  ASSERT_EQ(1U, reset_hist.size());
+  ASSERT_EQ(0U, reset_hist.back());
+}
+
+TEST_F(LRUCacheTest, QuickMRCAppendsCompleteMissBucket) {
+  NewCache(3);
+  Insert("a");
+  Insert("b");
+
+  ASSERT_FALSE(Lookup("x"));
+  ASSERT_FALSE(Lookup("y"));
+
+  std::vector<uint64_t> histogram = cache_->GetQuickMRCStackDistanceHistogram();
+  ASSERT_FALSE(histogram.empty());
+  ASSERT_EQ(2U, histogram.back());
 }
 
 }  // namespace ROCKSDB_NAMESPACE

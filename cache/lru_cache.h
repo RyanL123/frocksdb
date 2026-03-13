@@ -247,6 +247,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
 
   std::vector<uint64_t> GetQuickMRCStackDistanceHistogram() const;
   void ResetQuickMRCStats();
+  uint64_t GetQuickMRCCompleteMissCount() const;
 
   void TEST_GetLRUList(LRUHandle** lru, LRUHandle** lru_low_pri);
 
@@ -350,6 +351,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   uint32_t quick_mrc_histogram_bin_size_;
   uint64_t quick_mrc_next_bucket_id_;
   size_t quick_mrc_resident_entries_;
+  uint64_t quick_mrc_complete_miss_count_;
   std::deque<QuickMRCBucket> quick_mrc_cache_buckets_;
   std::deque<QuickMRCBucket> quick_mrc_ghost_buckets_;
   std::unordered_map<std::string, QuickMRCGhostEntry> quick_mrc_ghost_index_;

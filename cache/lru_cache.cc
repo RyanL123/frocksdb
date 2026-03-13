@@ -119,7 +119,8 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
       quick_mrc_sampling_denominator_(0),
       quick_mrc_histogram_bin_size_(quick_mrc_histogram_bin_size),
       quick_mrc_next_bucket_id_(1),
-      quick_mrc_resident_entries_(0) {
+      quick_mrc_resident_entries_(0),
+      quick_mrc_complete_miss_count_(0) {
   set_metadata_charge_policy(metadata_charge_policy);
   if (quick_mrc_sampling_rate_ >= 1.0) {
     quick_mrc_sampling_denominator_ = 1;
@@ -509,7 +510,9 @@ Cache::Handle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash) {
     e->Ref();
     e->SetHit();
   } else if (quick_mrc_enabled_) {
-    QuickMRCProbeGhost(key);
+    if (!QuickMRCProbeGhost(key)) {
+      quick_mrc_complete_miss_count_++;
+    }
   }
   return reinterpret_cast<Cache::Handle*>(e);
 }
@@ -734,9 +737,15 @@ std::vector<uint64_t> LRUCacheShard::GetQuickMRCStackDistanceHistogram() const {
   return quick_mrc_histogram_;
 }
 
+uint64_t LRUCacheShard::GetQuickMRCCompleteMissCount() const {
+  MutexLock l(&mutex_);
+  return quick_mrc_complete_miss_count_;
+}
+
 void LRUCacheShard::ResetQuickMRCStats() {
   MutexLock l(&mutex_);
   quick_mrc_histogram_.clear();
+  quick_mrc_complete_miss_count_ = 0;
 }
 
 LRUCache::LRUCache(size_t capacity, int num_shard_bits,
@@ -827,9 +836,11 @@ double LRUCache::GetHighPriPoolRatio() {
 
 std::vector<uint64_t> LRUCache::GetQuickMRCStackDistanceHistogram() const {
   std::vector<uint64_t> merged;
+  uint64_t complete_miss_count = 0;
   for (int i = 0; i < num_shards_; i++) {
     std::vector<uint64_t> shard_hist =
         shards_[i].GetQuickMRCStackDistanceHistogram();
+    complete_miss_count += shards_[i].GetQuickMRCCompleteMissCount();
     if (merged.size() < shard_hist.size()) {
       merged.resize(shard_hist.size(), 0);
     }
@@ -837,6 +848,7 @@ std::vector<uint64_t> LRUCache::GetQuickMRCStackDistanceHistogram() const {
       merged[j] += shard_hist[j];
     }
   }
+  merged.push_back(complete_miss_count);
   return merged;
 }
 
