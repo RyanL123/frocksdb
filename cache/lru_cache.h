@@ -80,6 +80,7 @@ struct LRUHandle {
   // quickMRC metadata for bucketed stack distance approximation.
   uint64_t quick_mrc_bucket_id = 0;
   bool quick_mrc_in_bucket = false;
+  size_t quick_mrc_charge_units = 0;
 
   // Beginning of the key (MUST BE THE LAST FIELD IN THIS STRUCT!)
   char key_data[1];
@@ -266,6 +267,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
 
   struct QuickMRCGhostEntry {
     uint64_t bucket_id = 0;
+    size_t charge_units = 0;
     std::list<std::string>::iterator lru_iter;
   };
 
@@ -274,10 +276,11 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
                                   const std::deque<QuickMRCBucket>& buckets,
                                   bool* found) const;
   void QuickMRCRecordDistance(size_t stack_distance, uint64_t weight = 1);
-  bool QuickMRCShouldSample(uint32_t hash) const;
+  static size_t QuickMRCChargeUnits(size_t charge);
+  bool QuickMRCShouldSample();
   void QuickMRCRemoveCacheHandleFromBucket(LRUHandle* e);
   void QuickMRCTouchCacheHandle(LRUHandle* e);
-  void QuickMRCInsertGhost(const Slice& key);
+  void QuickMRCInsertGhost(const Slice& key, size_t charge);
   bool QuickMRCProbeGhost(const Slice& key);
   void QuickMRCEnforceGhostCapacity();
 
@@ -349,8 +352,10 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   double quick_mrc_sampling_rate_;
   uint32_t quick_mrc_sampling_denominator_;
   uint32_t quick_mrc_histogram_bin_size_;
+  uint64_t quick_mrc_rng_state_;
   uint64_t quick_mrc_next_bucket_id_;
   size_t quick_mrc_resident_entries_;
+  size_t quick_mrc_resident_units_;
   uint64_t quick_mrc_complete_miss_count_;
   std::deque<QuickMRCBucket> quick_mrc_cache_buckets_;
   std::deque<QuickMRCBucket> quick_mrc_ghost_buckets_;

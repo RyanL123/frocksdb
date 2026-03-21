@@ -10,6 +10,8 @@
 #include "cache/lru_cache.h"
 
 #include <cassert>
+#include <cinttypes>
+#include <cstdint>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -17,6 +19,10 @@
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+constexpr size_t kQuickMRCBlockSize = 4096;
+}  // namespace
 
 LRUHandleTable::LRUHandleTable() : list_(nullptr), length_(0), elems_(0) {
   Resize();
@@ -118,8 +124,10 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
       quick_mrc_sampling_rate_(quick_mrc_sampling_rate),
       quick_mrc_sampling_denominator_(0),
       quick_mrc_histogram_bin_size_(quick_mrc_histogram_bin_size),
+      quick_mrc_rng_state_(0x9e3779b97f4a7c15ULL),
       quick_mrc_next_bucket_id_(1),
       quick_mrc_resident_entries_(0),
+      quick_mrc_resident_units_(0),
       quick_mrc_complete_miss_count_(0) {
   set_metadata_charge_policy(metadata_charge_policy);
   if (quick_mrc_sampling_rate_ >= 1.0) {
@@ -130,6 +138,15 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
     if (quick_mrc_sampling_denominator_ == 0) {
       quick_mrc_sampling_denominator_ = 1;
     }
+  }
+  // Mix cache/shard-specific parameters into the PRNG seed.
+  quick_mrc_rng_state_ ^= static_cast<uint64_t>(capacity);
+  quick_mrc_rng_state_ ^=
+      static_cast<uint64_t>(quick_mrc_max_bucket_size_) << 32;
+  quick_mrc_rng_state_ ^=
+      static_cast<uint64_t>(quick_mrc_ghost_cache_multiplier_) << 1;
+  if (quick_mrc_rng_state_ == 0) {
+    quick_mrc_rng_state_ = 1;
   }
   // Make empty circular linked list
   lru_.next = &lru_;
@@ -175,11 +192,23 @@ void LRUCacheShard::QuickMRCRecordDistance(size_t stack_distance,
   quick_mrc_histogram_[bin] += weight;
 }
 
-bool LRUCacheShard::QuickMRCShouldSample(uint32_t hash) const {
+size_t LRUCacheShard::QuickMRCChargeUnits(size_t charge) {
+  if (charge == 0) {
+    return 0;
+  }
+  return (charge + kQuickMRCBlockSize - 1) / kQuickMRCBlockSize;
+}
+
+bool LRUCacheShard::QuickMRCShouldSample() {
   if (!quick_mrc_enabled_ || quick_mrc_sampling_denominator_ == 0) {
     return false;
   }
-  return (hash % quick_mrc_sampling_denominator_) == 0;
+  // xorshift64*; cheap per-access pseudo-randomness under shard mutex.
+  quick_mrc_rng_state_ ^= quick_mrc_rng_state_ >> 12;
+  quick_mrc_rng_state_ ^= quick_mrc_rng_state_ << 25;
+  quick_mrc_rng_state_ ^= quick_mrc_rng_state_ >> 27;
+  const uint64_t random_value = quick_mrc_rng_state_ * 2685821657736338717ULL;
+  return (random_value % quick_mrc_sampling_denominator_) == 0;
 }
 
 void LRUCacheShard::QuickMRCRemoveCacheHandleFromBucket(LRUHandle* e) {
@@ -189,8 +218,8 @@ void LRUCacheShard::QuickMRCRemoveCacheHandleFromBucket(LRUHandle* e) {
   for (auto it = quick_mrc_cache_buckets_.begin();
        it != quick_mrc_cache_buckets_.end(); ++it) {
     if (it->id == e->quick_mrc_bucket_id) {
-      assert(it->size > 0);
-      it->size--;
+      assert(it->size >= e->quick_mrc_charge_units);
+      it->size -= e->quick_mrc_charge_units;
       if (it->size == 0) {
         quick_mrc_cache_buckets_.erase(it);
       }
@@ -204,17 +233,19 @@ void LRUCacheShard::QuickMRCTouchCacheHandle(LRUHandle* e) {
   if (!quick_mrc_enabled_) {
     return;
   }
+  e->quick_mrc_charge_units = QuickMRCChargeUnits(e->charge);
   QuickMRCRemoveCacheHandleFromBucket(e);
   QuickMRCEnsureFrontBucket(&quick_mrc_cache_buckets_);
   e->quick_mrc_bucket_id = quick_mrc_cache_buckets_.front().id;
   e->quick_mrc_in_bucket = true;
-  quick_mrc_cache_buckets_.front().size++;
+  quick_mrc_cache_buckets_.front().size += e->quick_mrc_charge_units;
 }
 
-void LRUCacheShard::QuickMRCInsertGhost(const Slice& key) {
+void LRUCacheShard::QuickMRCInsertGhost(const Slice& key, size_t charge) {
   if (!quick_mrc_enabled_ || quick_mrc_ghost_cache_multiplier_ == 0) {
     return;
   }
+  const size_t charge_units = QuickMRCChargeUnits(charge);
 
   const std::string key_str = key.ToString();
   auto existing = quick_mrc_ghost_index_.find(key_str);
@@ -222,8 +253,8 @@ void LRUCacheShard::QuickMRCInsertGhost(const Slice& key) {
     for (auto it = quick_mrc_ghost_buckets_.begin();
          it != quick_mrc_ghost_buckets_.end(); ++it) {
       if (it->id == existing->second.bucket_id) {
-        assert(it->size > 0);
-        it->size--;
+        assert(it->size >= existing->second.charge_units);
+        it->size -= existing->second.charge_units;
         if (it->size == 0) {
           quick_mrc_ghost_buckets_.erase(it);
         }
@@ -235,10 +266,11 @@ void LRUCacheShard::QuickMRCInsertGhost(const Slice& key) {
   }
 
   QuickMRCEnsureFrontBucket(&quick_mrc_ghost_buckets_);
-  quick_mrc_ghost_buckets_.front().size++;
+  quick_mrc_ghost_buckets_.front().size += charge_units;
   quick_mrc_ghost_lru_.push_front(key_str);
   QuickMRCGhostEntry ghost_entry;
   ghost_entry.bucket_id = quick_mrc_ghost_buckets_.front().id;
+  ghost_entry.charge_units = charge_units;
   ghost_entry.lru_iter = quick_mrc_ghost_lru_.begin();
   quick_mrc_ghost_index_[key_str] = ghost_entry;
   QuickMRCEnforceGhostCapacity();
@@ -252,21 +284,24 @@ bool LRUCacheShard::QuickMRCProbeGhost(const Slice& key) {
   if (it == quick_mrc_ghost_index_.end()) {
     return false;
   }
+  // Snapshot the ghost entry metadata before mutating/erasing the map entry.
+  const uint64_t bucket_id = it->second.bucket_id;
+  const size_t charge_units = it->second.charge_units;
+  const auto lru_iter = it->second.lru_iter;
 
   bool found = false;
   size_t ghost_distance =
-      QuickMRCEstimateDistance(it->second.bucket_id, quick_mrc_ghost_buckets_,
-                               &found);
+      QuickMRCEstimateDistance(bucket_id, quick_mrc_ghost_buckets_, &found);
   if (found) {
     // Ghost cache observations are always recorded (not sampled).
-    QuickMRCRecordDistance(quick_mrc_resident_entries_ + ghost_distance);
+    QuickMRCRecordDistance(quick_mrc_resident_units_ + ghost_distance);
   }
 
   for (auto bucket_it = quick_mrc_ghost_buckets_.begin();
        bucket_it != quick_mrc_ghost_buckets_.end(); ++bucket_it) {
-    if (bucket_it->id == it->second.bucket_id) {
-      assert(bucket_it->size > 0);
-      bucket_it->size--;
+    if (bucket_it->id == bucket_id) {
+      assert(bucket_it->size >= charge_units);
+      bucket_it->size -= charge_units;
       if (bucket_it->size == 0) {
         quick_mrc_ghost_buckets_.erase(bucket_it);
       }
@@ -274,14 +309,15 @@ bool LRUCacheShard::QuickMRCProbeGhost(const Slice& key) {
     }
   }
 
-  quick_mrc_ghost_lru_.erase(it->second.lru_iter);
+  quick_mrc_ghost_lru_.erase(lru_iter);
   quick_mrc_ghost_index_.erase(it);
 
   QuickMRCEnsureFrontBucket(&quick_mrc_ghost_buckets_);
-  quick_mrc_ghost_buckets_.front().size++;
+  quick_mrc_ghost_buckets_.front().size += charge_units;
   quick_mrc_ghost_lru_.push_front(key.ToString());
   QuickMRCGhostEntry ghost_entry;
   ghost_entry.bucket_id = quick_mrc_ghost_buckets_.front().id;
+  ghost_entry.charge_units = charge_units;
   ghost_entry.lru_iter = quick_mrc_ghost_lru_.begin();
   quick_mrc_ghost_index_[key.ToString()] = ghost_entry;
   return true;
@@ -301,8 +337,8 @@ void LRUCacheShard::QuickMRCEnforceGhostCapacity() {
       for (auto bucket_it = quick_mrc_ghost_buckets_.begin();
            bucket_it != quick_mrc_ghost_buckets_.end(); ++bucket_it) {
         if (bucket_it->id == it->second.bucket_id) {
-          assert(bucket_it->size > 0);
-          bucket_it->size--;
+          assert(bucket_it->size >= it->second.charge_units);
+          bucket_it->size -= it->second.charge_units;
           if (bucket_it->size == 0) {
             quick_mrc_ghost_buckets_.erase(bucket_it);
           }
@@ -330,6 +366,9 @@ void LRUCacheShard::EraseUnRefEntries() {
         QuickMRCRemoveCacheHandleFromBucket(old);
         if (quick_mrc_resident_entries_ > 0) {
           quick_mrc_resident_entries_--;
+        }
+        if (quick_mrc_resident_units_ >= old->quick_mrc_charge_units) {
+          quick_mrc_resident_units_ -= old->quick_mrc_charge_units;
         }
         QuickMRCEnforceGhostCapacity();
       }
@@ -453,7 +492,10 @@ void LRUCacheShard::EvictFromLRU(size_t charge,
       if (quick_mrc_resident_entries_ > 0) {
         quick_mrc_resident_entries_--;
       }
-      QuickMRCInsertGhost(old->key());
+      if (quick_mrc_resident_units_ >= old->quick_mrc_charge_units) {
+        quick_mrc_resident_units_ -= old->quick_mrc_charge_units;
+      }
+      QuickMRCInsertGhost(old->key(), old->charge);
     }
     size_t old_total_charge = old->CalcTotalCharge(metadata_charge_policy_);
     assert(usage_ >= old_total_charge);
@@ -486,7 +528,7 @@ Cache::Handle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash) {
   MutexLock l(&mutex_);
   LRUHandle* e = table_.Lookup(key, hash);
   if (e != nullptr) {
-    if (quick_mrc_enabled_ && QuickMRCShouldSample(hash)) {
+    if (quick_mrc_enabled_ && QuickMRCShouldSample()) {
       bool found = false;
       size_t stack_distance = QuickMRCEstimateDistance(
           e->quick_mrc_bucket_id, quick_mrc_cache_buckets_, &found);
@@ -497,6 +539,12 @@ Cache::Handle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash) {
                 ? 1
                 : static_cast<uint64_t>(quick_mrc_sampling_denominator_);
         QuickMRCRecordDistance(stack_distance, sample_weight);
+        // Emit sampled charge immediately for external log collection.
+        fprintf(stderr,
+                "quick_mrc_sampled_charge: charge=%" ROCKSDB_PRIszt
+                " sample_weight=%" PRIu64 " weighted_charge=%" PRIu64 "\n",
+                e->charge, sample_weight,
+                static_cast<uint64_t>(e->charge) * sample_weight);
       }
     }
     if (quick_mrc_enabled_) {
@@ -555,7 +603,10 @@ bool LRUCacheShard::Release(Cache::Handle* handle, bool force_erase) {
           if (quick_mrc_resident_entries_ > 0) {
             quick_mrc_resident_entries_--;
           }
-          QuickMRCInsertGhost(e->key());
+          if (quick_mrc_resident_units_ >= e->quick_mrc_charge_units) {
+            quick_mrc_resident_units_ -= e->quick_mrc_charge_units;
+          }
+          QuickMRCInsertGhost(e->key(), e->charge);
         }
       } else {
         // Put the item back on the LRU list, and don't free it
@@ -628,6 +679,7 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
       usage_ += total_charge;
       if (quick_mrc_enabled_) {
         quick_mrc_resident_entries_++;
+        quick_mrc_resident_units_ += QuickMRCChargeUnits(e->charge);
         QuickMRCTouchCacheHandle(e);
       }
       if (old != nullptr) {
@@ -639,7 +691,10 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
           if (quick_mrc_resident_entries_ > 0) {
             quick_mrc_resident_entries_--;
           }
-          QuickMRCInsertGhost(old->key());
+          if (quick_mrc_resident_units_ >= old->quick_mrc_charge_units) {
+            quick_mrc_resident_units_ -= old->quick_mrc_charge_units;
+          }
+          QuickMRCInsertGhost(old->key(), old->charge);
         }
         if (!old->HasRefs()) {
           // old is on LRU because it's in cache and its reference count is 0
@@ -682,7 +737,10 @@ void LRUCacheShard::Erase(const Slice& key, uint32_t hash) {
         if (quick_mrc_resident_entries_ > 0) {
           quick_mrc_resident_entries_--;
         }
-        QuickMRCInsertGhost(e->key());
+        if (quick_mrc_resident_units_ >= e->quick_mrc_charge_units) {
+          quick_mrc_resident_units_ -= e->quick_mrc_charge_units;
+        }
+        QuickMRCInsertGhost(e->key(), e->charge);
       }
       if (!e->HasRefs()) {
         // The entry is in LRU since it's in hash and has no external references
@@ -746,6 +804,23 @@ void LRUCacheShard::ResetQuickMRCStats() {
   MutexLock l(&mutex_);
   quick_mrc_histogram_.clear();
   quick_mrc_complete_miss_count_ = 0;
+  quick_mrc_cache_buckets_.clear();
+  quick_mrc_ghost_buckets_.clear();
+  quick_mrc_ghost_index_.clear();
+  quick_mrc_ghost_lru_.clear();
+  quick_mrc_resident_units_ = 0;
+  quick_mrc_resident_entries_ = 0;
+  quick_mrc_next_bucket_id_ = 1;
+  table_.ApplyToAllCacheEntries([this](LRUHandle* h) {
+    h->quick_mrc_in_bucket = false;
+    h->quick_mrc_bucket_id = 0;
+    h->quick_mrc_charge_units = 0;
+    if (h->InCache()) {
+      quick_mrc_resident_entries_++;
+      quick_mrc_resident_units_ += QuickMRCChargeUnits(h->charge);
+      QuickMRCTouchCacheHandle(h);
+    }
+  });
 }
 
 LRUCache::LRUCache(size_t capacity, int num_shard_bits,
