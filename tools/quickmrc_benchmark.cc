@@ -14,9 +14,13 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "rocksdb/cache.h"
+#include "rocksdb/env.h"
+#include "rocksdb/trace_reader_writer.h"
 #include "trace_replay/block_cache_tracer.h"
 #include "utilities/simulator_cache/cache_simulator.h"
 
@@ -43,6 +47,12 @@ struct BenchmarkConfig {
 
   std::string output_dir = ".";
   std::string output_prefix = "quickmrc_bench";
+
+  // If set, load a binary block cache trace from db_bench (--block_cache_trace_file)
+  // or any RocksDB BlockCacheTraceWriter output, instead of generating a synthetic trace.
+  std::string block_cache_trace_file;
+  uint64_t block_cache_trace_max_accesses = 0;  // 0 = load until EOF
+  uint32_t trace_data_blocks_only = 0;          // 1 = skip non-data-block records
 };
 
 static void PrintUsage(const char* prog) {
@@ -72,6 +82,13 @@ static void PrintUsage(const char* prog) {
     "Output:\n"
     "  --output_dir=PATH         Output directory (default: .)\n"
     "  --output_prefix=STR       File name prefix (default: quickmrc_bench)\n"
+    "\n"
+    "Trace file (db_bench --block_cache_trace_file=...):\n"
+    "  --block_cache_trace_file=PATH  If set, load this binary block cache trace\n"
+    "                                 instead of synthetic workload (ignores seed/skew/\n"
+    "                                 num_accesses/num_unique_blocks for generation).\n"
+    "  --block_cache_trace_max_accesses=N  Stop after N records (0 = all; default: 0).\n"
+    "  --trace_data_blocks_only=1    Only keep kBlockTraceDataBlock accesses.\n"
     "\n"
     "  --help                    Show this message\n",
     prog);
@@ -135,6 +152,9 @@ static BenchmarkConfig ParseArgs(int argc, char** argv) {
     matched = matched || TryParseFlag(argv[i], "quickmrc_cache_capacity", &cfg.quickmrc_cache_capacity);
     matched = matched || TryParseFlag(argv[i], "output_dir", &cfg.output_dir);
     matched = matched || TryParseFlag(argv[i], "output_prefix", &cfg.output_prefix);
+    matched = matched || TryParseFlag(argv[i], "block_cache_trace_file", &cfg.block_cache_trace_file);
+    matched = matched || TryParseFlag(argv[i], "block_cache_trace_max_accesses", &cfg.block_cache_trace_max_accesses);
+    matched = matched || TryParseFlag(argv[i], "trace_data_blocks_only", &cfg.trace_data_blocks_only);
     if (!matched) {
       fprintf(stderr, "Unknown flag: %s\n", argv[i]);
       PrintUsage(argv[0]);
@@ -158,9 +178,11 @@ static std::vector<uint64_t> ParseCapacities(const std::string& csv) {
   return caps;
 }
 
-static std::vector<uint64_t> AutoCapacities(uint64_t num_unique_blocks) {
+static std::vector<uint64_t> AutoCapacitiesForMaxBytes(uint64_t max_bytes) {
   std::vector<uint64_t> caps;
-  uint64_t max_bytes = num_unique_blocks * kBlockSize;
+  if (max_bytes == 0) {
+    max_bytes = kBlockSize;
+  }
   uint64_t step = std::max<uint64_t>(kBlockSize, max_bytes / 50);
   for (uint64_t c = step; c <= max_bytes; c += step) {
     caps.push_back(c);
@@ -169,6 +191,61 @@ static std::vector<uint64_t> AutoCapacities(uint64_t num_unique_blocks) {
     caps.push_back(max_bytes);
   }
   return caps;
+}
+
+static std::vector<uint64_t> AutoCapacities(uint64_t num_unique_blocks) {
+  return AutoCapacitiesForMaxBytes(num_unique_blocks * kBlockSize);
+}
+
+// Sum of block_size over distinct block_key (max size per key), matching cache footprint.
+static uint64_t UniqueBlocksFootprintBytes(
+    const std::vector<BlockCacheTraceRecord>& trace) {
+  std::unordered_map<std::string, uint64_t> charge_per_key;
+  for (const auto& r : trace) {
+    auto it = charge_per_key.find(r.block_key);
+    if (it == charge_per_key.end() || r.block_size > it->second) {
+      charge_per_key[r.block_key] = r.block_size;
+    }
+  }
+  uint64_t sum = 0;
+  for (const auto& p : charge_per_key) {
+    sum += p.second;
+  }
+  return sum;
+}
+
+// Load binary block cache trace (same format as db_bench --block_cache_trace_file).
+static Status LoadBlockCacheTraceBinary(
+    const std::string& path, uint64_t max_accesses, bool data_blocks_only,
+    std::vector<BlockCacheTraceRecord>* out_trace) {
+  std::unique_ptr<TraceReader> trace_reader;
+  Status s = NewFileTraceReader(Env::Default(), EnvOptions(), path, &trace_reader);
+  if (!s.ok()) {
+    return s;
+  }
+  BlockCacheTraceReader reader(std::move(trace_reader));
+  BlockCacheTraceHeader header;
+  s = reader.ReadHeader(&header);
+  if (!s.ok()) {
+    return s;
+  }
+  out_trace->clear();
+  while (max_accesses == 0 || out_trace->size() < max_accesses) {
+    BlockCacheTraceRecord rec;
+    s = reader.ReadAccess(&rec);
+    if (!s.ok()) {
+      if (s.IsIncomplete()) {
+        return Status::OK();
+      }
+      return s;
+    }
+    if (data_blocks_only &&
+        rec.block_type != TraceType::kBlockTraceDataBlock) {
+      continue;
+    }
+    out_trace->push_back(std::move(rec));
+  }
+  return Status::OK();
 }
 
 static std::vector<BlockCacheTraceRecord> GenerateTrace(
@@ -362,7 +439,10 @@ static void WriteRunConfig(const std::string& path,
   out << "  \"quickmrc_cache_capacity\": " << cfg.quickmrc_cache_capacity << ",\n";
   out << "  \"sim_num_shard_bits\": " << cfg.sim_num_shard_bits << ",\n";
   out << "  \"warmup_seconds\": " << cfg.warmup_seconds << ",\n";
-  out << "  \"cache_capacities\": \"" << cfg.cache_capacities << "\"\n";
+  out << "  \"cache_capacities\": \"" << cfg.cache_capacities << "\",\n";
+  out << "  \"block_cache_trace_file\": \"" << cfg.block_cache_trace_file << "\",\n";
+  out << "  \"block_cache_trace_max_accesses\": " << cfg.block_cache_trace_max_accesses << ",\n";
+  out << "  \"trace_data_blocks_only\": " << cfg.trace_data_blocks_only << "\n";
   out << "}\n";
   out.close();
 }
@@ -372,27 +452,65 @@ static void WriteRunConfig(const std::string& path,
 static int Run(int argc, char** argv) {
   BenchmarkConfig cfg = ParseArgs(argc, argv);
 
-  if (cfg.num_unique_blocks == 0 || cfg.num_accesses == 0) {
-    fprintf(stderr, "num_accesses and num_unique_blocks must be > 0\n");
-    return 1;
+  const bool use_trace_file = !cfg.block_cache_trace_file.empty();
+  if (!use_trace_file) {
+    if (cfg.num_unique_blocks == 0 || cfg.num_accesses == 0) {
+      fprintf(stderr, "num_accesses and num_unique_blocks must be > 0\n");
+      return 1;
+    }
+  }
+
+  std::vector<BlockCacheTraceRecord> trace;
+  uint64_t unique_footprint_bytes = 0;
+
+  if (use_trace_file) {
+    printf("Loading block cache trace: %s\n", cfg.block_cache_trace_file.c_str());
+    Status st = LoadBlockCacheTraceBinary(
+        cfg.block_cache_trace_file, cfg.block_cache_trace_max_accesses,
+        cfg.trace_data_blocks_only != 0, &trace);
+    if (!st.ok()) {
+      fprintf(stderr, "Failed to load trace: %s\n", st.ToString().c_str());
+      return 1;
+    }
+    if (trace.empty()) {
+      fprintf(stderr, "Trace is empty (check file path, filters, or max_accesses).\n");
+      return 1;
+    }
+    unique_footprint_bytes = UniqueBlocksFootprintBytes(trace);
+    std::unordered_set<std::string> distinct_keys;
+    distinct_keys.reserve(trace.size());
+    for (const auto& r : trace) {
+      distinct_keys.insert(r.block_key);
+    }
+    printf("  Loaded %zu accesses, distinct block keys %zu, unique footprint %" PRIu64
+           " bytes\n",
+           trace.size(), distinct_keys.size(), unique_footprint_bytes);
   }
 
   std::vector<uint64_t> capacities = ParseCapacities(cfg.cache_capacities);
   if (capacities.empty()) {
-    capacities = AutoCapacities(cfg.num_unique_blocks);
+    if (use_trace_file) {
+      capacities = AutoCapacitiesForMaxBytes(unique_footprint_bytes);
+    } else {
+      capacities = AutoCapacities(cfg.num_unique_blocks);
+    }
     printf("Auto-generated %zu capacity points\n", capacities.size());
   } else {
     printf("Using %zu user-specified capacity points\n", capacities.size());
   }
 
-  printf("Generating trace: %" PRIu64 " accesses, %" PRIu64 " unique blocks, "
-         "seed=%" PRIu64 ", skew=%u\n",
-         cfg.num_accesses, cfg.num_unique_blocks, cfg.seed, cfg.skew);
-  auto trace = GenerateTrace(cfg);
+  if (!use_trace_file) {
+    printf("Generating trace: %" PRIu64 " accesses, %" PRIu64 " unique blocks, "
+           "seed=%" PRIu64 ", skew=%u\n",
+           cfg.num_accesses, cfg.num_unique_blocks, cfg.seed, cfg.skew);
+    trace = GenerateTrace(cfg);
+    unique_footprint_bytes = cfg.num_unique_blocks * kBlockSize;
+  }
 
   uint64_t qmrc_cache_cap = cfg.quickmrc_cache_capacity;
   if (qmrc_cache_cap == 0) {
-    qmrc_cache_cap = cfg.num_unique_blocks * kBlockSize;
+    qmrc_cache_cap = use_trace_file ? unique_footprint_bytes
+                                    : cfg.num_unique_blocks * kBlockSize;
   }
   printf("Running QuickMRC path (cache_capacity=%" PRIu64
          ", sampling_rate=%.4f, bin_size=%u) ...\n",
