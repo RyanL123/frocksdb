@@ -1333,6 +1333,11 @@ if(WITH_BENCHMARK_TOOLS)
   target_link_libraries(cache_bench${ARTIFACT_SUFFIX}
     ${ROCKSDB_LIB} ${GFLAGS_LIB})
 
+  add_executable(quickmrc_benchmark${ARTIFACT_SUFFIX}
+    tools/quickmrc_benchmark.cc)
+  target_link_libraries(quickmrc_benchmark${ARTIFACT_SUFFIX}
+    ${ROCKSDB_LIB} ${GFLAGS_LIB})
+
   add_executable(memtablerep_bench${ARTIFACT_SUFFIX}
     memtable/memtablerep_bench.cc)
   target_link_libraries(memtablerep_bench${ARTIFACT_SUFFIX}

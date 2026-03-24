@@ -366,6 +366,7 @@ BENCH_MAIN_SOURCES =                                                    \
   memtable/memtablerep_bench.cc                                         \
   table/table_reader_bench.cc                                           \
   tools/db_bench.cc                                                     \
+  tools/quickmrc_benchmark.cc                                           \
   util/filter_bench.cc                                                  \
   utilities/persistent_cache/persistent_cache_bench.cc                  \
   #util/log_write_bench.cc                                               \

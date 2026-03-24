@@ -1274,6 +1274,9 @@ endif
 cache_bench: $(OBJ_DIR)/cache/cache_bench.o $(LIBRARY)
 	$(AM_LINK)
 
+quickmrc_benchmark: $(OBJ_DIR)/tools/quickmrc_benchmark.o $(LIBRARY)
+	$(AM_LINK)
+
 persistent_cache_bench: $(OBJ_DIR)/utilities/persistent_cache/persistent_cache_bench.o $(LIBRARY)
 	$(AM_LINK)
 
