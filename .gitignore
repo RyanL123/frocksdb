@@ -54,6 +54,7 @@ db_test2
 trace_analyzer
 trace_analyzer_test
 block_cache_trace_analyzer
+quickmrc_benchmark
 io_tracer_parser
 .DS_Store
 .vs
